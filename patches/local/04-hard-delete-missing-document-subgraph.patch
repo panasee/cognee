@@ -1,0 +1,188 @@
+From be11ed85be56a001cc67e3480fef22f2d866b741 Mon Sep 17 00:00:00 2001
+From: panasee <dongkai.pan@gmail.com>
+Date: Tue, 14 Apr 2026 18:33:37 +0800
+Subject: [PATCH] Allow hard deletes to continue when legacy document subgraphs
+ are missing
+
+Some locally patched datasets no longer have the legacy document
+subgraph that `legacy_delete` expects. Hard deletes should still
+remove the relational record in that case instead of aborting the
+whole operation, while soft deletes keep their existing failure mode.
+
+Constraint: Must preserve current soft-delete semantics and permission checks
+Rejected: Swallow the legacy-delete error in all modes | would hide real regressions in the default delete path
+Confidence: high
+Scope-risk: narrow
+Directive: Do not broaden this exception handling beyond hard delete without new deletion coverage
+Tested: ruff check touched files; targeted unit test suite (49 passed)
+Not-tested: End-to-end deletion against a live graph backend with mixed legacy data
+---
+ cognee/api/v1/datasets/datasets.py            |  13 +-
+ .../unit/api/v1/test_datasets_namespace.py    | 124 ++++++++++++++++++
+ 2 files changed, 136 insertions(+), 1 deletion(-)
+ create mode 100644 cognee/tests/unit/api/v1/test_datasets_namespace.py
+
+diff --git a/cognee/api/v1/datasets/datasets.py b/cognee/api/v1/datasets/datasets.py
+index 7ddb66188..592499851 100644
+--- a/cognee/api/v1/datasets/datasets.py
++++ b/cognee/api/v1/datasets/datasets.py
+@@ -3,6 +3,7 @@ from uuid import UUID
+ from typing import Optional
+ 
+ from cognee.context_global_variables import set_database_global_context_variables
++from cognee.api.v1.exceptions.exceptions import DocumentSubgraphNotFoundError
+ from cognee.modules.users.models import User
+ from cognee.modules.users.methods import get_default_user
+ from cognee.modules.users.exceptions import PermissionDeniedError
+@@ -162,7 +163,17 @@ class datasets:
+         await set_database_global_context_variables(dataset_id, dataset.owner_id)
+ 
+         if not await has_data_related_nodes(dataset_id, data_id):
+-            await legacy_delete(data, "soft")
++            try:
++                await legacy_delete(data, "hard" if mode == "hard" else "soft")
++            except DocumentSubgraphNotFoundError:
++                if mode != "hard":
++                    raise
++
++                logger.warning(
++                    "Hard delete continuing after missing document subgraph for data_id=%s in dataset_id=%s",
++                    data_id,
++                    dataset_id,
++                )
+         else:
+             await delete_data_nodes_and_edges(dataset_id, data_id, user.id)
+ 
+diff --git a/cognee/tests/unit/api/v1/test_datasets_namespace.py b/cognee/tests/unit/api/v1/test_datasets_namespace.py
+new file mode 100644
+index 000000000..154326411
+--- /dev/null
++++ b/cognee/tests/unit/api/v1/test_datasets_namespace.py
+@@ -0,0 +1,124 @@
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++from uuid import uuid4
++import importlib
++
++import pytest
++
++from cognee.api.v1.exceptions.exceptions import DocumentSubgraphNotFoundError
++
++
++@pytest.mark.asyncio
++async def test_delete_data_hard_mode_tolerates_missing_document_subgraph(monkeypatch):
++    datasets_module = importlib.import_module("cognee.api.v1.datasets.datasets")
++
++    dataset_id = uuid4()
++    data_id = uuid4()
++    user = SimpleNamespace(id=uuid4())
++    dataset = SimpleNamespace(id=dataset_id, owner_id=uuid4())
++    data = SimpleNamespace(id=data_id, datasets=[SimpleNamespace(id=dataset_id)])
++
++    delete_data_mock = AsyncMock()
++
++    monkeypatch.setattr(
++        datasets_module,
++        "get_authorized_dataset",
++        AsyncMock(return_value=dataset),
++    )
++    monkeypatch.setattr(
++        datasets_module,
++        "get_dataset_data",
++        AsyncMock(side_effect=[[data], [data]]),
++    )
++    monkeypatch.setattr(
++        datasets_module,
++        "has_data_related_nodes",
++        AsyncMock(return_value=False),
++    )
++    monkeypatch.setattr(
++        datasets_module,
++        "legacy_delete",
++        AsyncMock(side_effect=DocumentSubgraphNotFoundError("missing")),
++    )
++    monkeypatch.setattr(
++        datasets_module,
++        "set_database_global_context_variables",
++        AsyncMock(),
++    )
++    monkeypatch.setattr(
++        datasets_module,
++        "delete_data_nodes_and_edges",
++        AsyncMock(),
++    )
++    monkeypatch.setattr(
++        datasets_module,
++        "logger",
++        SimpleNamespace(warning=lambda *args, **kwargs: None),
++    )
++    monkeypatch.setattr(
++        datasets_module,
++        "has_dataset_data",
++        AsyncMock(return_value=True),
++    )
++    monkeypatch.setattr(
++        datasets_module,
++        "get_default_user",
++        AsyncMock(return_value=user),
++    )
++
++    monkeypatch.setattr("cognee.modules.data.methods.delete_data", delete_data_mock)
++
++    result = await datasets_module.datasets.delete_data(
++        dataset_id=dataset_id,
++        data_id=data_id,
++        user=user,
++        mode="hard",
++    )
++
++    assert result == {"status": "success"}
++    delete_data_mock.assert_awaited_once_with(data, dataset_id)
++
++
++@pytest.mark.asyncio
++async def test_delete_data_soft_mode_still_raises_missing_document_subgraph(monkeypatch):
++    datasets_module = importlib.import_module("cognee.api.v1.datasets.datasets")
++
++    dataset_id = uuid4()
++    data_id = uuid4()
++    user = SimpleNamespace(id=uuid4())
++    dataset = SimpleNamespace(id=dataset_id, owner_id=uuid4())
++    data = SimpleNamespace(id=data_id, datasets=[SimpleNamespace(id=dataset_id)])
++
++    monkeypatch.setattr(
++        datasets_module,
++        "get_authorized_dataset",
++        AsyncMock(return_value=dataset),
++    )
++    monkeypatch.setattr(
++        datasets_module,
++        "get_dataset_data",
++        AsyncMock(return_value=[data]),
++    )
++    monkeypatch.setattr(
++        datasets_module,
++        "has_data_related_nodes",
++        AsyncMock(return_value=False),
++    )
++    monkeypatch.setattr(
++        datasets_module,
++        "legacy_delete",
++        AsyncMock(side_effect=DocumentSubgraphNotFoundError("missing")),
++    )
++    monkeypatch.setattr(
++        datasets_module,
++        "set_database_global_context_variables",
++        AsyncMock(),
++    )
++
++    with pytest.raises(DocumentSubgraphNotFoundError, match="missing"):
++        await datasets_module.datasets.delete_data(
++            dataset_id=dataset_id,
++            data_id=data_id,
++            user=user,
++            mode="soft",
++        )
+-- 
+2.47.3
+
