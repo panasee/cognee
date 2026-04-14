@@ -41,6 +41,12 @@ async def get_formatted_graph_data(dataset_id: UUID, user: User):
                     "source": str(edge[0]),
                     "target": str(edge[1]),
                     "label": str(edge[2]),
+                    "edge_object_id": (
+                        edge[3].get("edge_object_id")
+                        if len(edge) > 3 and isinstance(edge[3], dict)
+                        else None
+                    ),
+                    "properties": edge[3] if len(edge) > 3 and isinstance(edge[3], dict) else {},
                 },
                 edges,
             )
