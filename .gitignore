@@ -205,4 +205,5 @@ SWE-bench_testsample/
 
 deployment/helm/values-local.yml
 .omx/
+.codex
 .codex/
