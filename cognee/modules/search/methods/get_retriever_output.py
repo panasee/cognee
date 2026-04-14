@@ -41,6 +41,11 @@ async def get_retriever_output(query_type: SearchType, query_text: str, **kwargs
             f"{retriever_class} retrieved {obj_count} object(s)",
         )
 
+    used_graph_element_ids = None
+    extract_used_graph_element_ids = getattr(retriever_instance, "extract_used_graph_element_ids", None)
+    if callable(extract_used_graph_element_ids):
+        used_graph_element_ids = extract_used_graph_element_ids(retrieved_objects)
+
     # Centralized access tracking for all retriever types
     if retrieved_objects:
         await update_node_access_timestamps(retrieved_objects)
@@ -84,6 +89,7 @@ async def get_retriever_output(query_type: SearchType, query_text: str, **kwargs
         dataset_name=kwargs.get("dataset").name if kwargs.get("dataset") else None,
         dataset_id=kwargs.get("dataset").id if kwargs.get("dataset") else None,
         dataset_tenant_id=kwargs.get("dataset").tenant_id if kwargs.get("dataset") else None,
+        used_graph_element_ids=used_graph_element_ids,
     )
 
     return search_result

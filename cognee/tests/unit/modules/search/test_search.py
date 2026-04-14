@@ -208,3 +208,49 @@ async def test_search_passes_retriever_specific_config_to_authorized_search(
     )
 
     assert out
+
+
+@pytest.mark.asyncio
+async def test_search_verbose_includes_used_graph_element_ids(monkeypatch, search_mod):
+    user = _make_user()
+    ds = _make_dataset(name="ds1", tenant_id="t1")
+
+    async def dummy_authorized_search(**_kwargs):
+        return [
+            SearchResultPayload(
+                result_object="object",
+                context="ctx",
+                completion="answer",
+                search_type=SearchType.GRAPH_COMPLETION,
+                dataset_name=ds.name,
+                dataset_id=ds.id,
+                dataset_tenant_id=ds.tenant_id,
+                used_graph_element_ids={
+                    "node_ids": ["node-1", "node-2"],
+                    "edge_ids": ["edge-1"],
+                },
+            )
+        ]
+
+    monkeypatch.setattr(search_mod, "backend_access_control_enabled", lambda: True)
+    monkeypatch.setattr(search_mod, "authorized_search", dummy_authorized_search)
+
+    out = await search_mod.search(
+        query_text="q",
+        query_type=SearchType.GRAPH_COMPLETION,
+        dataset_ids=[ds.id],
+        user=user,
+        verbose=True,
+    )
+
+    assert out == [
+        {
+            "dataset_id": ds.id,
+            "dataset_name": "ds1",
+            "dataset_tenant_id": uuid5(NAMESPACE_OID, "t1"),
+            "text_result": "answer",
+            "context_result": "ctx",
+            "objects_result": "object",
+            "used_graph_element_ids": {"node_ids": ["node-1", "node-2"], "edge_ids": ["edge-1"]},
+        }
+    ]

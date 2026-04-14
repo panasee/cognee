@@ -17,6 +17,7 @@ class SearchResultPayload(BaseModel):
     result_object: Any = None
     context: Optional[Union[str, List[str]]] = None
     completion: Optional[Union[str, List[str], List[dict]]] = None
+    used_graph_element_ids: Optional[dict[str, List[str]]] = None
 
     # TODO: Add return_type info
     search_type: SearchType

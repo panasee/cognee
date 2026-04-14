@@ -348,6 +348,10 @@ def _backwards_compatible_search_results(search_results, verbose: bool):
                 search_result_dict["text_result"] = search_result.completion
                 search_result_dict["context_result"] = search_result.context
                 search_result_dict["objects_result"] = search_result.result_object
+                if search_result.used_graph_element_ids is not None:
+                    search_result_dict["used_graph_element_ids"] = (
+                        search_result.used_graph_element_ids
+                    )
             else:
                 # Result attribute handles returning appropriate result based on set flags and outputs
                 search_result_dict["search_result"] = search_result.result
@@ -362,6 +366,7 @@ def _backwards_compatible_search_results(search_results, verbose: bool):
                 search_result_dict = {
                     "text_result": search_result.completion,
                     "context_result": search_result.context,
+                    "used_graph_element_ids": search_result.used_graph_element_ids,
                     "objects_result": search_result.result_object,
                 }
                 return_value.append(search_result_dict)
