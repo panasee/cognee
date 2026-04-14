@@ -41,6 +41,10 @@ COPY ./distributed /app/distributed
 RUN --mount=type=cache,target=/root/.cache/uv \
 uv sync --extra debug --extra api --extra postgres --extra neo4j --extra llama-index --extra ollama --extra mistral --extra groq --extra anthropic --extra chromadb --frozen --no-dev --no-editable
 
+# Install the community Falkor hybrid adapter into the runtime virtualenv managed by uv.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python /app/.venv/bin/python --upgrade --refresh-package cognee-community-hybrid-adapter-falkor cognee-community-hybrid-adapter-falkor
+
 FROM python:3.12-slim-bookworm
 
 RUN apt-get update && apt-get install -y \

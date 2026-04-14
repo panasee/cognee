@@ -2,6 +2,121 @@
 
 import os
 
+if os.getenv("VECTOR_DB_PROVIDER", "").lower() == "qdrant":
+    from cognee_community_vector_adapter_qdrant import register  # noqa: F401
+elif os.getenv("VECTOR_DB_PROVIDER", "").lower() in {"falkor", "falkordb"} or os.getenv(
+    "GRAPH_DATABASE_PROVIDER", ""
+).lower() == "falkor":
+    from cognee_community_hybrid_adapter_falkor import register  # noqa: F401
+    import abc
+    from cognee_community_hybrid_adapter_falkor.falkor_adapter import FalkorDBAdapter
+
+    async def _falkor_get_neighborhood(
+        self,
+        node_ids: list[str],
+        depth: int = 1,
+        edge_types: list[str] | None = None,
+    ) -> tuple[list[tuple[str, dict]], list[tuple[str, str, str, dict]]]:
+        """Compatibility patch for community Falkor adapter on Cognee 1.x."""
+        if not node_ids:
+            return [], []
+
+        params: dict[str, object] = {"node_ids": node_ids}
+        if edge_types:
+            params["edge_types"] = edge_types
+            path_query = f"""
+            MATCH path = (seed)-[*1..{depth}]-(neighbor)
+            WHERE seed.id IN $node_ids
+              AND ALL(
+                r IN relationships(path)
+                WHERE TYPE(r) IN $edge_types
+                   OR coalesce(r.relationship_name, '') IN $edge_types
+              )
+            RETURN DISTINCT neighbor.id AS nid
+            """
+        else:
+            path_query = f"""
+            MATCH (seed)-[*1..{depth}]-(neighbor)
+            WHERE seed.id IN $node_ids
+            RETURN DISTINCT neighbor.id AS nid
+            """
+
+        path_result = await self.query(path_query, params)
+        neighbor_ids = [
+            str(record[0]) for record in getattr(path_result, "result_set", []) if record and record[0]
+        ]
+        all_ids = list(dict.fromkeys([*node_ids, *neighbor_ids]))
+
+        nodes_result = await self.query(
+            """
+            MATCH (n)
+            WHERE n.id IN $ids
+            RETURN n.id AS id, properties(n) AS properties
+            """,
+            {"ids": all_ids},
+        )
+        nodes = [
+            (str(record[0]), record[1] if isinstance(record[1], dict) else {})
+            for record in getattr(nodes_result, "result_set", [])
+            if record
+        ]
+
+        edge_params: dict[str, object] = {"ids": all_ids}
+        edge_filter = ""
+        if edge_types:
+            edge_params["edge_types"] = edge_types
+            edge_filter = """
+              AND (
+                TYPE(r) IN $edge_types
+                OR coalesce(r.relationship_name, '') IN $edge_types
+              )
+            """
+
+        edges_result = await self.query(
+            f"""
+            MATCH (a)-[r]->(b)
+            WHERE a.id IN $ids AND b.id IN $ids
+            {edge_filter}
+            RETURN a.id AS source_id, b.id AS target_id, TYPE(r) AS relationship_name,
+                   properties(r) AS properties
+            """,
+            edge_params,
+        )
+        edges = []
+        for record in getattr(edges_result, "result_set", []):
+            if not record:
+                continue
+            properties = record[3] if len(record) > 3 and isinstance(record[3], dict) else {}
+            source_id = str(properties.get("source_node_id", record[0]))
+            target_id = str(properties.get("target_node_id", record[1]))
+            relationship_name = str(properties.get("relationship_name", record[2]))
+            edges.append((source_id, target_id, relationship_name, properties))
+
+        return nodes, edges
+
+    if "get_neighborhood" in getattr(FalkorDBAdapter, "__abstractmethods__", set()):
+        FalkorDBAdapter.get_neighborhood = _falkor_get_neighborhood
+        abc.update_abstractmethods(FalkorDBAdapter)
+
+    async def _falkor_get_degree_one_nodes(self, node_type: str) -> list:
+        """Compatibility patch for FalkorDB's Cypher subset."""
+        if not node_type or node_type not in ["Entity", "EntityType"]:
+            raise ValueError("node_type must be either 'Entity' or 'EntityType'")
+
+        result = await self.query(
+            f"""
+            MATCH (n:{node_type})
+            OPTIONAL MATCH (n)--(neighbor)
+            WITH n, COUNT(neighbor) AS degree
+            WHERE degree = 1
+            RETURN n
+            """
+        )
+
+        return [record[0] for record in getattr(result, "result_set", []) if record]
+
+    FalkorDBAdapter.get_degree_one_nodes = _falkor_get_degree_one_nodes
+
 import uvicorn
 from traceback import format_exc
 from contextlib import asynccontextmanager
