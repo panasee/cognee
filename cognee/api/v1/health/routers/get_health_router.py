@@ -10,7 +10,20 @@ def get_health_router():
     @health_router.get("", response_model=dict)
     async def health_check():
         """
-        Health check endpoint for liveness/readiness probes.
+        Lightweight liveness probe.
+
+        This route must stay cheap because orchestrators often poll it at a
+        high frequency. It only reports whether the API process is alive.
+        """
+        return JSONResponse(status_code=200, content=health_checker.get_liveness_status())
+
+    @health_router.get("/ready", response_model=dict)
+    async def readiness_check():
+        """
+        Readiness probe with dependency checks.
+
+        Use this endpoint for lower-frequency readiness checks when callers
+        need confirmation that storage and database backends are available.
         """
         try:
             health_status = await health_checker.get_health_status(detailed=False)
@@ -22,6 +35,7 @@ def get_health_router():
                     "status": "ready" if status_code == 200 else "not ready",
                     "health": health_status.status,
                     "version": health_status.version,
+                    "probe": "readiness",
                 },
             )
         except Exception as e:

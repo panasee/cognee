@@ -40,6 +40,20 @@ class HealthChecker:
     def __init__(self):
         self.start_time = time.time()
 
+    def get_liveness_status(self) -> dict:
+        """Return a lightweight process liveness payload.
+
+        This avoids touching downstream services on hot probe paths such as
+        container health checks and load balancer polling.
+        """
+        return {
+            "status": "ready",
+            "health": HealthStatus.HEALTHY,
+            "version": get_cognee_version(),
+            "uptime": int(time.time() - self.start_time),
+            "probe": "liveness",
+        }
+
     async def check_relational_db(self) -> ComponentHealth:
         """Check relational database health."""
         start_time = time.time()
@@ -52,12 +66,9 @@ class HealthChecker:
             config = get_relational_config()
             engine = get_relational_engine()
 
-            try:
-                async with engine.get_async_session() as session:
-                    # This works for both SQLite and PostgreSQL
-                    await session.execute(text("SELECT 1"))
-            finally:
-                session.close()
+            async with engine.get_async_session() as session:
+                # This works for both SQLite and PostgreSQL
+                await session.execute(text("SELECT 1"))
 
             response_time = int((time.time() - start_time) * 1000)
             return ComponentHealth(
