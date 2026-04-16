@@ -32,6 +32,7 @@ def get_remember_router() -> APIRouter:
         texts: Optional[List[str]] = Form(default=None),
         datasetName: Optional[str] = Form(default=None),
         datasetId: Union[UUID, Literal[""], None] = Form(default=None, examples=[""]),
+        session_id: Optional[str] = Form(default=None),
         node_set: Optional[List[str]] = Form(default=[""], example=[""]),
         run_in_background: Optional[bool] = Form(default=False),
         custom_prompt: Optional[str] = Form(default=""),
@@ -99,6 +100,7 @@ def get_remember_router() -> APIRouter:
             result = await cognee_remember(
                 remember_payload,
                 dataset_name=datasetName,
+                session_id=session_id,
                 user=user,
                 dataset_id=datasetId if datasetId else None,
                 node_set=node_set if node_set != [""] else None,
