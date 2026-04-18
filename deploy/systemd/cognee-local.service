@@ -1,0 +1,15 @@
+[Unit]
+Description=Cognee Local API Server (User)
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/cognee
+EnvironmentFile=%h/workspace/cognee/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/miniconda3/envs/unified/bin/python -u -m cognee.api.client
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
