@@ -126,6 +126,26 @@ class TestConditionalAuthenticationEnvironmentVariables:
 
             assert REQUIRE_AUTHENTICATION
 
+    def test_backend_access_control_does_not_force_http_authentication(self):
+        """EBAC enabled on its own should not flip REQUIRE_AUTHENTICATION to true."""
+        with patch.dict(
+            os.environ,
+            {
+                "REQUIRE_AUTHENTICATION": "false",
+                "ENABLE_BACKEND_ACCESS_CONTROL": "true",
+            },
+            clear=False,
+        ):
+            module_name = "cognee.modules.users.methods.get_authenticated_user"
+            if module_name in sys.modules:
+                del sys.modules[module_name]
+
+            from cognee.modules.users.methods.get_authenticated_user import (
+                REQUIRE_AUTHENTICATION,
+            )
+
+            assert not REQUIRE_AUTHENTICATION
+
 
 class TestConditionalAuthenticationEdgeCases:
     """Test edge cases and error scenarios."""

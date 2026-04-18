@@ -490,3 +490,23 @@ async def test_get_completion_empty_context(mock_edge):
 
     assert isinstance(completion, list)
     assert len(completion) == 1
+
+
+@pytest.mark.asyncio
+async def test_extract_used_graph_element_ids_returns_nodes_and_edges(mock_edge):
+    retriever = GraphCompletionRetriever()
+
+    mock_node1 = MagicMock()
+    mock_node1.id = "node-1"
+    mock_node2 = MagicMock()
+    mock_node2.id = "node-2"
+    mock_edge.node1 = mock_node1
+    mock_edge.node2 = mock_node2
+    mock_edge.attributes = {"edge_object_id": "edge-1"}
+
+    ids = retriever.extract_used_graph_element_ids([mock_edge])
+
+    assert ids == {
+        "node_ids": ["node-1", "node-2"],
+        "edge_ids": ["edge-1"],
+    }

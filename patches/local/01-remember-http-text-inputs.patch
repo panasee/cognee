@@ -1,0 +1,214 @@
+From a0e578b574af4108d502fd8737a6c5678ba7e4f6 Mon Sep 17 00:00:00 2001
+From: panasee <dongkai.pan@gmail.com>
+Date: Tue, 14 Apr 2026 18:30:02 +0800
+Subject: [PATCH] Expose direct text payloads for remember HTTP ingestion
+
+OpenClaw-style HTTP callers need to remember plain text without
+uploading files. The router now accepts a single `text` field or
+repeated `texts` form fields while preserving the existing uploaded
+file path and dataset-selection behavior.
+
+Constraint: Must preserve existing multipart file uploads and dataset selection semantics
+Rejected: Add a new JSON-only endpoint | would duplicate the existing remember API surface
+Confidence: high
+Scope-risk: narrow
+Directive: Keep text-vs-file precedence stable unless clients are migrated in lockstep
+Tested: ruff check touched files; targeted unit test suite (49 passed)
+Not-tested: End-to-end multipart requests against a live FastAPI server
+---
+ .../remember/routers/get_remember_router.py   |  22 ++-
+ .../tests/unit/api/v1/test_remember_router.py | 131 ++++++++++++++++++
+ 2 files changed, 152 insertions(+), 1 deletion(-)
+ create mode 100644 cognee/tests/unit/api/v1/test_remember_router.py
+
+diff --git a/cognee/api/v1/remember/routers/get_remember_router.py b/cognee/api/v1/remember/routers/get_remember_router.py
+index 23bf71ac6..2dbc7cac4 100644
+--- a/cognee/api/v1/remember/routers/get_remember_router.py
++++ b/cognee/api/v1/remember/routers/get_remember_router.py
+@@ -28,6 +28,8 @@ def get_remember_router() -> APIRouter:
+     @log_usage(function_name="POST /v1/remember", log_type="api_endpoint")
+     async def remember(
+         data: List[UploadFile] = File(default=None),
++        text: Optional[str] = Form(default=None),
++        texts: Optional[List[str]] = Form(default=None),
+         datasetName: Optional[str] = Form(default=None),
+         datasetId: Union[UUID, Literal[""], None] = Form(default=None, examples=[""]),
+         node_set: Optional[List[str]] = Form(default=[""], example=[""]),
+@@ -44,6 +46,8 @@ def get_remember_router() -> APIRouter:
+ 
+         ## Request Parameters
+         - **data** (List[UploadFile]): Files to upload and process.
++        - **text** (Optional[str]): Plain text to remember as a single item.
++        - **texts** (Optional[List[str]]): Plain text memory items submitted as repeated form fields.
+         - **datasetName** (Optional[str]): Name of the target dataset.
+         - **datasetId** (Optional[UUID]): UUID of an existing dataset.
+         - **node_set** (Optional[List[str]]): Node identifiers for graph organisation.
+@@ -73,11 +77,27 @@ def get_remember_router() -> APIRouter:
+                 detail="Either datasetId or datasetName must be provided.",
+             )
+ 
++        normalized_texts = [item for item in (texts or []) if isinstance(item, str) and item.strip()]
++        normalized_text = text.strip() if isinstance(text, str) and text.strip() else None
++
++        remember_payload = None
++        if data:
++            remember_payload = data
++        elif normalized_texts:
++            remember_payload = normalized_texts
++        elif normalized_text:
++            remember_payload = normalized_text
++        else:
++            raise HTTPException(
++                status_code=400,
++                detail="At least one of data, text, or texts must be provided.",
++            )
++
+         from cognee.api.v1.remember import remember as cognee_remember
+ 
+         try:
+             result = await cognee_remember(
+-                data,
++                remember_payload,
+                 dataset_name=datasetName,
+                 user=user,
+                 dataset_id=datasetId if datasetId else None,
+diff --git a/cognee/tests/unit/api/v1/test_remember_router.py b/cognee/tests/unit/api/v1/test_remember_router.py
+new file mode 100644
+index 000000000..80388cb17
+--- /dev/null
++++ b/cognee/tests/unit/api/v1/test_remember_router.py
+@@ -0,0 +1,131 @@
++from types import SimpleNamespace
++from uuid import uuid4
++import importlib
++
++import pytest
++from fastapi import HTTPException
++from fastapi.routing import APIRoute
++
++
++def _get_route_endpoint(router, path: str, method: str):
++    for route in router.routes:
++        if isinstance(route, APIRoute) and route.path == path and method in route.methods:
++            return route.endpoint
++
++    raise AssertionError(f"Route {method} {path} not found")
++
++
++@pytest.mark.asyncio
++async def test_remember_accepts_single_text_form_field(monkeypatch):
++    remember_api_module = importlib.import_module("cognee.api.v1.remember")
++    remember_router_module = importlib.import_module(
++        "cognee.api.v1.remember.routers.get_remember_router"
++    )
++    usage_logger_module = importlib.import_module("cognee.shared.usage_logger")
++
++    captured = {}
++
++    async def fake_remember(payload, **kwargs):
++        captured["payload"] = payload
++        captured["kwargs"] = kwargs
++        return SimpleNamespace(to_dict=lambda: {"status": "ok"})
++
++    monkeypatch.setattr(remember_api_module, "remember", fake_remember)
++    monkeypatch.setattr(remember_router_module, "send_telemetry", lambda *args, **kwargs: None)
++    monkeypatch.setattr(
++        usage_logger_module,
++        "get_cache_config",
++        lambda: SimpleNamespace(usage_logging=False),
++    )
++
++    endpoint = _get_route_endpoint(remember_router_module.get_remember_router(), "", "POST")
++    response = await endpoint(
++        data=None,
++        text="  hello world  ",
++        texts=None,
++        datasetName="memory",
++        datasetId=None,
++        node_set=[""],
++        run_in_background=False,
++        custom_prompt="",
++        chunks_per_batch=10,
++        user=SimpleNamespace(id=str(uuid4())),
++    )
++
++    assert response == {"status": "ok"}
++    assert captured["payload"] == "hello world"
++    assert captured["kwargs"]["dataset_name"] == "memory"
++    assert captured["kwargs"]["node_set"] is None
++
++
++@pytest.mark.asyncio
++async def test_remember_accepts_repeated_texts_form_field(monkeypatch):
++    remember_api_module = importlib.import_module("cognee.api.v1.remember")
++    remember_router_module = importlib.import_module(
++        "cognee.api.v1.remember.routers.get_remember_router"
++    )
++    usage_logger_module = importlib.import_module("cognee.shared.usage_logger")
++
++    captured = {}
++
++    async def fake_remember(payload, **kwargs):
++        captured["payload"] = payload
++        captured["kwargs"] = kwargs
++        return SimpleNamespace(to_dict=lambda: {"status": "ok"})
++
++    monkeypatch.setattr(remember_api_module, "remember", fake_remember)
++    monkeypatch.setattr(remember_router_module, "send_telemetry", lambda *args, **kwargs: None)
++    monkeypatch.setattr(
++        usage_logger_module,
++        "get_cache_config",
++        lambda: SimpleNamespace(usage_logging=False),
++    )
++
++    endpoint = _get_route_endpoint(remember_router_module.get_remember_router(), "", "POST")
++    response = await endpoint(
++        data=None,
++        text=None,
++        texts=["alpha", " ", "beta"],
++        datasetName="memory",
++        datasetId=None,
++        node_set=["topic"],
++        run_in_background=False,
++        custom_prompt="",
++        chunks_per_batch=10,
++        user=SimpleNamespace(id=str(uuid4())),
++    )
++
++    assert response == {"status": "ok"}
++    assert captured["payload"] == ["alpha", "beta"]
++    assert captured["kwargs"]["node_set"] == ["topic"]
++
++
++@pytest.mark.asyncio
++async def test_remember_requires_input_payload(monkeypatch):
++    remember_router_module = importlib.import_module(
++        "cognee.api.v1.remember.routers.get_remember_router"
++    )
++    usage_logger_module = importlib.import_module("cognee.shared.usage_logger")
++
++    monkeypatch.setattr(remember_router_module, "send_telemetry", lambda *args, **kwargs: None)
++    monkeypatch.setattr(
++        usage_logger_module,
++        "get_cache_config",
++        lambda: SimpleNamespace(usage_logging=False),
++    )
++
++    endpoint = _get_route_endpoint(remember_router_module.get_remember_router(), "", "POST")
++
++    with pytest.raises(HTTPException, match="At least one of data, text, or texts must be provided."):
++        await endpoint(
++            data=None,
++            text=None,
++            texts=None,
++            datasetName="memory",
++            datasetId=None,
++            node_set=[""],
++            run_in_background=False,
++            custom_prompt="",
++            chunks_per_batch=10,
++            user=SimpleNamespace(id=str(uuid4())),
++        )
+-- 
+2.47.3
+

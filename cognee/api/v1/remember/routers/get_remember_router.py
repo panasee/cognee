@@ -28,8 +28,11 @@ def get_remember_router() -> APIRouter:
     @log_usage(function_name="POST /v1/remember", log_type="api_endpoint")
     async def remember(
         data: List[UploadFile] = File(default=None),
+        text: Optional[str] = Form(default=None),
+        texts: Optional[List[str]] = Form(default=None),
         datasetName: Optional[str] = Form(default=None),
         datasetId: Union[UUID, Literal[""], None] = Form(default=None, examples=[""]),
+        session_id: Optional[str] = Form(default=None),
         node_set: Optional[List[str]] = Form(default=[""], example=[""]),
         run_in_background: Optional[bool] = Form(default=False),
         custom_prompt: Optional[str] = Form(default=""),
@@ -44,6 +47,8 @@ def get_remember_router() -> APIRouter:
 
         ## Request Parameters
         - **data** (List[UploadFile]): Files to upload and process.
+        - **text** (Optional[str]): Plain text to remember as a single item.
+        - **texts** (Optional[List[str]]): Plain text memory items submitted as repeated form fields.
         - **datasetName** (Optional[str]): Name of the target dataset.
         - **datasetId** (Optional[UUID]): UUID of an existing dataset.
         - **node_set** (Optional[List[str]]): Node identifiers for graph organisation.
@@ -73,12 +78,29 @@ def get_remember_router() -> APIRouter:
                 detail="Either datasetId or datasetName must be provided.",
             )
 
+        normalized_texts = [item for item in (texts or []) if isinstance(item, str) and item.strip()]
+        normalized_text = text.strip() if isinstance(text, str) and text.strip() else None
+
+        remember_payload = None
+        if data:
+            remember_payload = data
+        elif normalized_texts:
+            remember_payload = normalized_texts
+        elif normalized_text:
+            remember_payload = normalized_text
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="At least one of data, text, or texts must be provided.",
+            )
+
         from cognee.api.v1.remember import remember as cognee_remember
 
         try:
             result = await cognee_remember(
-                data,
+                remember_payload,
                 dataset_name=datasetName,
+                session_id=session_id,
                 user=user,
                 dataset_id=datasetId if datasetId else None,
                 node_set=node_set if node_set != [""] else None,

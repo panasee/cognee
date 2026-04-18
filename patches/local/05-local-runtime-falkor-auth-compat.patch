@@ -1,0 +1,223 @@
+From 5e365ed4c7c02b2a9cc3064599ad45dc3f2dae0f Mon Sep 17 00:00:00 2001
+From: panasee <dongkai.pan@gmail.com>
+Date: Tue, 14 Apr 2026 18:33:57 +0800
+Subject: [PATCH] Harden local Falkor runtime wiring and decouple optional HTTP
+ auth
+
+The local fork needs to boot with the community Falkor adapter and
+still allow single-user HTTP access when backend access control stays
+enabled. This installs the adapter in the image, applies the Falkor
+compatibility shims at API startup, and keeps REQUIRE_AUTHENTICATION
+independent from ENABLE_BACKEND_ACCESS_CONTROL.
+
+Constraint: Must keep local deployment working without changing the public API surface
+Rejected: Force API auth whenever EBAC is enabled | breaks local single-user deployments that still need dataset isolation
+Confidence: medium
+Scope-risk: moderate
+Directive: Revisit the startup monkey patches once the community Falkor adapter natively supports Cognee 1.x
+Tested: ruff check touched files; targeted unit test suite (49 passed)
+Not-tested: Container startup against a live FalkorDB instance
+---
+ Dockerfile                                    |   4 +
+ cognee/api/client.py                          | 115 ++++++++++++++++++
+ .../users/methods/get_authenticated_user.py   |  11 +-
+ .../users/test_conditional_authentication.py  |  20 +++
+ 4 files changed, 145 insertions(+), 5 deletions(-)
+
+diff --git a/Dockerfile b/Dockerfile
+index f22f7f75c..41c98ef54 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -41,6 +41,10 @@ COPY ./distributed /app/distributed
+ RUN --mount=type=cache,target=/root/.cache/uv \
+ uv sync --extra debug --extra api --extra postgres --extra neo4j --extra llama-index --extra ollama --extra mistral --extra groq --extra anthropic --extra chromadb --frozen --no-dev --no-editable
+ 
++# Install the community Falkor hybrid adapter into the runtime virtualenv managed by uv.
++RUN --mount=type=cache,target=/root/.cache/uv \
++    uv pip install --python /app/.venv/bin/python --upgrade --refresh-package cognee-community-hybrid-adapter-falkor cognee-community-hybrid-adapter-falkor
++
+ FROM python:3.12-slim-bookworm
+ 
+ RUN apt-get update && apt-get install -y \
+diff --git a/cognee/api/client.py b/cognee/api/client.py
+index 997bbfa7c..f47d98cde 100644
+--- a/cognee/api/client.py
++++ b/cognee/api/client.py
+@@ -2,6 +2,121 @@
+ 
+ import os
+ 
++if os.getenv("VECTOR_DB_PROVIDER", "").lower() == "qdrant":
++    from cognee_community_vector_adapter_qdrant import register  # noqa: F401
++elif os.getenv("VECTOR_DB_PROVIDER", "").lower() in {"falkor", "falkordb"} or os.getenv(
++    "GRAPH_DATABASE_PROVIDER", ""
++).lower() == "falkor":
++    from cognee_community_hybrid_adapter_falkor import register  # noqa: F401
++    import abc
++    from cognee_community_hybrid_adapter_falkor.falkor_adapter import FalkorDBAdapter
++
++    async def _falkor_get_neighborhood(
++        self,
++        node_ids: list[str],
++        depth: int = 1,
++        edge_types: list[str] | None = None,
++    ) -> tuple[list[tuple[str, dict]], list[tuple[str, str, str, dict]]]:
++        """Compatibility patch for community Falkor adapter on Cognee 1.x."""
++        if not node_ids:
++            return [], []
++
++        params: dict[str, object] = {"node_ids": node_ids}
++        if edge_types:
++            params["edge_types"] = edge_types
++            path_query = f"""
++            MATCH path = (seed)-[*1..{depth}]-(neighbor)
++            WHERE seed.id IN $node_ids
++              AND ALL(
++                r IN relationships(path)
++                WHERE TYPE(r) IN $edge_types
++                   OR coalesce(r.relationship_name, '') IN $edge_types
++              )
++            RETURN DISTINCT neighbor.id AS nid
++            """
++        else:
++            path_query = f"""
++            MATCH (seed)-[*1..{depth}]-(neighbor)
++            WHERE seed.id IN $node_ids
++            RETURN DISTINCT neighbor.id AS nid
++            """
++
++        path_result = await self.query(path_query, params)
++        neighbor_ids = [
++            str(record[0]) for record in getattr(path_result, "result_set", []) if record and record[0]
++        ]
++        all_ids = list(dict.fromkeys([*node_ids, *neighbor_ids]))
++
++        nodes_result = await self.query(
++            """
++            MATCH (n)
++            WHERE n.id IN $ids
++            RETURN n.id AS id, properties(n) AS properties
++            """,
++            {"ids": all_ids},
++        )
++        nodes = [
++            (str(record[0]), record[1] if isinstance(record[1], dict) else {})
++            for record in getattr(nodes_result, "result_set", [])
++            if record
++        ]
++
++        edge_params: dict[str, object] = {"ids": all_ids}
++        edge_filter = ""
++        if edge_types:
++            edge_params["edge_types"] = edge_types
++            edge_filter = """
++              AND (
++                TYPE(r) IN $edge_types
++                OR coalesce(r.relationship_name, '') IN $edge_types
++              )
++            """
++
++        edges_result = await self.query(
++            f"""
++            MATCH (a)-[r]->(b)
++            WHERE a.id IN $ids AND b.id IN $ids
++            {edge_filter}
++            RETURN a.id AS source_id, b.id AS target_id, TYPE(r) AS relationship_name,
++                   properties(r) AS properties
++            """,
++            edge_params,
++        )
++        edges = []
++        for record in getattr(edges_result, "result_set", []):
++            if not record:
++                continue
++            properties = record[3] if len(record) > 3 and isinstance(record[3], dict) else {}
++            source_id = str(properties.get("source_node_id", record[0]))
++            target_id = str(properties.get("target_node_id", record[1]))
++            relationship_name = str(properties.get("relationship_name", record[2]))
++            edges.append((source_id, target_id, relationship_name, properties))
++
++        return nodes, edges
++
++    if "get_neighborhood" in getattr(FalkorDBAdapter, "__abstractmethods__", set()):
++        FalkorDBAdapter.get_neighborhood = _falkor_get_neighborhood
++        abc.update_abstractmethods(FalkorDBAdapter)
++
++    async def _falkor_get_degree_one_nodes(self, node_type: str) -> list:
++        """Compatibility patch for FalkorDB's Cypher subset."""
++        if not node_type or node_type not in ["Entity", "EntityType"]:
++            raise ValueError("node_type must be either 'Entity' or 'EntityType'")
++
++        result = await self.query(
++            f"""
++            MATCH (n:{node_type})
++            OPTIONAL MATCH (n)--(neighbor)
++            WITH n, COUNT(neighbor) AS degree
++            WHERE degree = 1
++            RETURN n
++            """
++        )
++
++        return [record[0] for record in getattr(result, "result_set", []) if record]
++
++    FalkorDBAdapter.get_degree_one_nodes = _falkor_get_degree_one_nodes
++
+ import uvicorn
+ from traceback import format_exc
+ from contextlib import asynccontextmanager
+diff --git a/cognee/modules/users/methods/get_authenticated_user.py b/cognee/modules/users/methods/get_authenticated_user.py
+index 30c15600b..0842bfd80 100644
+--- a/cognee/modules/users/methods/get_authenticated_user.py
++++ b/cognee/modules/users/methods/get_authenticated_user.py
+@@ -9,11 +9,12 @@ from cognee.shared.logging_utils import get_logger
+ 
+ logger = get_logger("get_authenticated_user")
+ 
+-# Check environment variable to determine authentication requirement
+-REQUIRE_AUTHENTICATION = (
+-    os.getenv("REQUIRE_AUTHENTICATION", "true").lower() == "true"
+-    or os.environ.get("ENABLE_BACKEND_ACCESS_CONTROL", "true").lower() == "true"
+-)
++# Authentication and backend access control are intentionally decoupled here.
++# ENABLE_BACKEND_ACCESS_CONTROL governs dataset routing / permission-aware
++# resolution, while REQUIRE_AUTHENTICATION alone decides whether HTTP requests
++# must carry an authenticated user. In local single-user deployments we still
++# want EBAC-enabled dataset isolation without forcing API auth on every call.
++REQUIRE_AUTHENTICATION = os.getenv("REQUIRE_AUTHENTICATION", "true").lower() == "true"
+ 
+ fastapi_users = get_fastapi_users()
+ 
+diff --git a/cognee/tests/unit/modules/users/test_conditional_authentication.py b/cognee/tests/unit/modules/users/test_conditional_authentication.py
+index 6568c3cb0..3fe51fe93 100644
+--- a/cognee/tests/unit/modules/users/test_conditional_authentication.py
++++ b/cognee/tests/unit/modules/users/test_conditional_authentication.py
+@@ -126,6 +126,26 @@ class TestConditionalAuthenticationEnvironmentVariables:
+ 
+             assert REQUIRE_AUTHENTICATION
+ 
++    def test_backend_access_control_does_not_force_http_authentication(self):
++        """EBAC enabled on its own should not flip REQUIRE_AUTHENTICATION to true."""
++        with patch.dict(
++            os.environ,
++            {
++                "REQUIRE_AUTHENTICATION": "false",
++                "ENABLE_BACKEND_ACCESS_CONTROL": "true",
++            },
++            clear=False,
++        ):
++            module_name = "cognee.modules.users.methods.get_authenticated_user"
++            if module_name in sys.modules:
++                del sys.modules[module_name]
++
++            from cognee.modules.users.methods.get_authenticated_user import (
++                REQUIRE_AUTHENTICATION,
++            )
++
++            assert not REQUIRE_AUTHENTICATION
++
+ 
+ class TestConditionalAuthenticationEdgeCases:
+     """Test edge cases and error scenarios."""
+-- 
+2.47.3
+

@@ -1,7 +1,6 @@
 import json
 import asyncio
 from uuid import UUID
-from fastapi.encoders import jsonable_encoder
 from typing import Any, List, Optional, Tuple, Type, Union
 
 from cognee.infrastructure.databases.graph import get_graph_engine
@@ -122,9 +121,19 @@ async def search(
         },
     )
 
+    # Log only the completion text (what the user sees), not the full
+    # serialized graph payload. The raw result_objects can be 50-100 KB
+    # each and cause unbounded DB growth in long-running deployments.
+    completions = []
+    for item in search_results:
+        payload = item[0] if isinstance(item, tuple) else item
+        if hasattr(payload, "completion") and payload.completion:
+            completions.append(payload.completion)
+        elif hasattr(payload, "context") and payload.context:
+            completions.append(payload.context)
     await log_result(
         query.id,
-        json.dumps(jsonable_encoder(search_results)),
+        json.dumps(completions) if completions else "[]",
         user.id,
     )
 
@@ -348,6 +357,10 @@ def _backwards_compatible_search_results(search_results, verbose: bool):
                 search_result_dict["text_result"] = search_result.completion
                 search_result_dict["context_result"] = search_result.context
                 search_result_dict["objects_result"] = search_result.result_object
+                if search_result.used_graph_element_ids is not None:
+                    search_result_dict["used_graph_element_ids"] = (
+                        search_result.used_graph_element_ids
+                    )
             else:
                 # Result attribute handles returning appropriate result based on set flags and outputs
                 search_result_dict["search_result"] = search_result.result
@@ -362,6 +375,7 @@ def _backwards_compatible_search_results(search_results, verbose: bool):
                 search_result_dict = {
                     "text_result": search_result.completion,
                     "context_result": search_result.context,
+                    "used_graph_element_ids": search_result.used_graph_element_ids,
                     "objects_result": search_result.result_object,
                 }
                 return_value.append(search_result_dict)

@@ -99,3 +99,15 @@ def test_dataset_schema_payload_dto_validation():
     dto_empty = DatasetSchemaPayloadDTO()
     assert dto_empty.graph_schema is None
     assert dto_empty.custom_prompt is None
+
+
+def test_graph_feedback_weights_helpers():
+    """Verify graph feedback helpers dedupe ids and clamp updates."""
+    from cognee.api.v1.datasets.routers.get_datasets_router import (
+        _stream_update_weight,
+        _unique_ids,
+    )
+
+    assert _unique_ids(["node-1", "", "node-1", "node-2"]) == ["node-1", "node-2"]
+    assert _stream_update_weight(0.2, 1.0, 0.5) == 0.6
+    assert _stream_update_weight(0.95, 1.0, 2.0) == 1.0

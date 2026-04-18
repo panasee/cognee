@@ -9,11 +9,12 @@ from cognee.shared.logging_utils import get_logger
 
 logger = get_logger("get_authenticated_user")
 
-# Check environment variable to determine authentication requirement
-REQUIRE_AUTHENTICATION = (
-    os.getenv("REQUIRE_AUTHENTICATION", "true").lower() == "true"
-    or os.environ.get("ENABLE_BACKEND_ACCESS_CONTROL", "true").lower() == "true"
-)
+# Authentication and backend access control are intentionally decoupled here.
+# ENABLE_BACKEND_ACCESS_CONTROL governs dataset routing / permission-aware
+# resolution, while REQUIRE_AUTHENTICATION alone decides whether HTTP requests
+# must carry an authenticated user. In local single-user deployments we still
+# want EBAC-enabled dataset isolation without forcing API auth on every call.
+REQUIRE_AUTHENTICATION = os.getenv("REQUIRE_AUTHENTICATION", "true").lower() == "true"
 
 fastapi_users = get_fastapi_users()
 

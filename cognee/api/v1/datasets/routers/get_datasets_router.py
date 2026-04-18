@@ -10,12 +10,15 @@ from fastapi import HTTPException, Query, Depends
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse, Response
 from urllib.parse import urlparse
 from pathlib import Path
+from pydantic import Field
+from cognee.context_global_variables import set_database_global_context_variables
+from cognee.infrastructure.databases.graph.get_graph_engine import get_graph_engine
 
 from cognee import datasets
 from cognee.api.DTO import InDTO, OutDTO
 from cognee.infrastructure.databases.relational import get_relational_engine
 from cognee.modules.data.methods import get_authorized_existing_datasets
-from cognee.modules.data.methods import create_dataset, get_datasets_by_name
+from cognee.modules.data.methods import create_dataset, get_authorized_dataset, get_datasets_by_name
 from cognee.shared.logging_utils import get_logger
 from cognee.api.v1.exceptions import DataNotFoundError
 from cognee.modules.users.models import User
@@ -66,6 +69,8 @@ class GraphEdgeDTO(OutDTO):
     source: UUID
     target: UUID
     label: str
+    edge_object_id: Optional[str] = None
+    properties: dict = Field(default_factory=dict)
 
 
 class GraphDTO(OutDTO):
@@ -80,6 +85,29 @@ class DatasetCreationPayload(InDTO):
 class DatasetSchemaPayloadDTO(InDTO):
     graph_schema: Optional[Dict[str, Any]] = None
     custom_prompt: Optional[str] = None
+
+
+class GraphFeedbackWeightsUpdatePayloadDTO(InDTO):
+    node_ids: list[str] = Field(default_factory=list)
+    edge_ids: list[str] = Field(default_factory=list)
+    target: float
+    alpha: float = 0.05
+
+
+def _stream_update_weight(previous_weight: float, target: float, alpha: float) -> float:
+    updated = float(previous_weight) + float(alpha) * (float(target) - float(previous_weight))
+    clipped = max(0.0, min(1.0, updated))
+    return round(clipped, 4)
+
+
+def _unique_ids(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if isinstance(value, str) and value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
 
 
 def get_datasets_router() -> APIRouter:
@@ -297,6 +325,56 @@ def get_datasets_router() -> APIRouter:
         graph_data = await get_formatted_graph_data(dataset_id, user)
 
         return graph_data
+
+    @router.post("/{dataset_id}/graph/feedback-weights")
+    async def update_dataset_graph_feedback_weights(
+        dataset_id: UUID,
+        payload: GraphFeedbackWeightsUpdatePayloadDTO,
+        user: User = Depends(get_authenticated_user),
+    ):
+        dataset = await get_authorized_dataset(user, dataset_id, "write")
+        if not dataset:
+            raise HTTPException(status_code=404, detail="Dataset not found or not writable")
+
+        if payload.alpha <= 0 or payload.alpha > 1:
+            raise HTTPException(status_code=400, detail="alpha must be in range (0, 1]")
+        if payload.target < 0 or payload.target > 1:
+            raise HTTPException(status_code=400, detail="target must be in range 0..1")
+
+        await set_database_global_context_variables(dataset.id, dataset.owner_id)
+        graph_engine = await get_graph_engine()
+
+        node_ids = _unique_ids(payload.node_ids or [])
+        edge_ids = _unique_ids(payload.edge_ids or [])
+
+        existing_node_weights = await graph_engine.get_node_feedback_weights(node_ids) if node_ids else {}
+        existing_edge_weights = await graph_engine.get_edge_feedback_weights(edge_ids) if edge_ids else {}
+
+        node_updates = {
+            node_id: _stream_update_weight(weight, payload.target, payload.alpha)
+            for node_id, weight in existing_node_weights.items()
+        }
+        edge_updates = {
+            edge_id: _stream_update_weight(weight, payload.target, payload.alpha)
+            for edge_id, weight in existing_edge_weights.items()
+        }
+
+        node_result = await graph_engine.set_node_feedback_weights(node_updates) if node_updates else {}
+        edge_result = await graph_engine.set_edge_feedback_weights(edge_updates) if edge_updates else {}
+
+        applied = sum(1 for ok in node_result.values() if ok) + sum(1 for ok in edge_result.values() if ok)
+        processed = len(node_ids) + len(edge_ids)
+        skipped = processed - applied
+
+        return {
+            "processed": processed,
+            "applied": applied,
+            "skipped": skipped,
+            "target": payload.target,
+            "alpha": payload.alpha,
+            "node_count": len(node_ids),
+            "edge_count": len(edge_ids),
+        }
 
     @router.get(
         "/{dataset_id}/data",

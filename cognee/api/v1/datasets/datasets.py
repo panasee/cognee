@@ -3,6 +3,7 @@ from uuid import UUID
 from typing import Optional
 
 from cognee.context_global_variables import set_database_global_context_variables
+from cognee.api.v1.exceptions.exceptions import DocumentSubgraphNotFoundError
 from cognee.modules.users.models import User
 from cognee.modules.users.methods import get_default_user
 from cognee.modules.users.exceptions import PermissionDeniedError
@@ -162,7 +163,17 @@ class datasets:
         await set_database_global_context_variables(dataset_id, dataset.owner_id)
 
         if not await has_data_related_nodes(dataset_id, data_id):
-            await legacy_delete(data, "soft")
+            try:
+                await legacy_delete(data, "hard" if mode == "hard" else "soft")
+            except DocumentSubgraphNotFoundError:
+                if mode != "hard":
+                    raise
+
+                logger.warning(
+                    "Hard delete continuing after missing document subgraph for data_id=%s in dataset_id=%s",
+                    data_id,
+                    dataset_id,
+                )
         else:
             await delete_data_nodes_and_edges(dataset_id, data_id, user.id)
 

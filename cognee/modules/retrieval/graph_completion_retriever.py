@@ -239,6 +239,9 @@ class GraphCompletionRetriever(BaseRetriever):
 
         return await self.resolve_edges_to_text(triplets)
 
+    def extract_used_graph_element_ids(self, retrieved_objects: Any) -> Optional[Dict[str, List[str]]]:
+        return self._extract_context_object_ids(retrieved_objects)
+
     def _extract_context_object_ids(self, retrieved_objects: Any) -> Optional[Dict[str, List[str]]]:
         """Extract node_ids and edge_ids from list of Edge. Only used for single-query session path."""
         if not isinstance(retrieved_objects, list) or not retrieved_objects:

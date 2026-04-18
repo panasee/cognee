@@ -1,0 +1,390 @@
+From dfb1c15f2fbf3b08778a9909d2c1cec47a122af9 Mon Sep 17 00:00:00 2001
+From: panasee <dongkai.pan@gmail.com>
+Date: Tue, 14 Apr 2026 18:32:09 +0800
+Subject: [PATCH] Expose dataset graph edge details and feedback weight updates
+
+The local memify workflow needs two dataset-level graph capabilities:
+full edge metadata on graph reads and a bulk feedback-weight update
+endpoint on graph writes. This commit adds both so clients can fade
+or promote nodes and edges without reaching into adapter internals.
+
+Constraint: Must work with the existing dataset permission model and graph engine interfaces
+Rejected: Expose adapter methods directly to clients | would bypass dataset authorization and payload validation
+Confidence: high
+Scope-risk: moderate
+Directive: Keep graph payload edge properties backward-compatible; new fields should remain additive
+Tested: ruff check touched files; targeted unit test suite (49 passed)
+Not-tested: Live graph-engine integration for the new HTTP endpoint
+---
+ .../datasets/routers/get_datasets_router.py   |  80 ++++++++++++-
+ .../graph/methods/get_formatted_graph_data.py |   6 +
+ .../v1/test_dataset_graph_feedback_weights.py | 112 ++++++++++++++++++
+ .../api/v1/test_dataset_schema_endpoints.py   |  12 ++
+ .../graph/test_get_formatted_graph_data.py    |  82 +++++++++++++
+ 5 files changed, 291 insertions(+), 1 deletion(-)
+ create mode 100644 cognee/tests/unit/api/v1/test_dataset_graph_feedback_weights.py
+ create mode 100644 cognee/tests/unit/modules/graph/test_get_formatted_graph_data.py
+
+diff --git a/cognee/api/v1/datasets/routers/get_datasets_router.py b/cognee/api/v1/datasets/routers/get_datasets_router.py
+index df60f5624..33f84c081 100644
+--- a/cognee/api/v1/datasets/routers/get_datasets_router.py
++++ b/cognee/api/v1/datasets/routers/get_datasets_router.py
+@@ -10,12 +10,15 @@ from fastapi import HTTPException, Query, Depends
+ from fastapi.responses import JSONResponse, FileResponse, StreamingResponse, Response
+ from urllib.parse import urlparse
+ from pathlib import Path
++from pydantic import Field
++from cognee.context_global_variables import set_database_global_context_variables
++from cognee.infrastructure.databases.graph.get_graph_engine import get_graph_engine
+ 
+ from cognee import datasets
+ from cognee.api.DTO import InDTO, OutDTO
+ from cognee.infrastructure.databases.relational import get_relational_engine
+ from cognee.modules.data.methods import get_authorized_existing_datasets
+-from cognee.modules.data.methods import create_dataset, get_datasets_by_name
++from cognee.modules.data.methods import create_dataset, get_authorized_dataset, get_datasets_by_name
+ from cognee.shared.logging_utils import get_logger
+ from cognee.api.v1.exceptions import DataNotFoundError
+ from cognee.modules.users.models import User
+@@ -66,6 +69,8 @@ class GraphEdgeDTO(OutDTO):
+     source: UUID
+     target: UUID
+     label: str
++    edge_object_id: Optional[str] = None
++    properties: dict = Field(default_factory=dict)
+ 
+ 
+ class GraphDTO(OutDTO):
+@@ -82,6 +87,29 @@ class DatasetSchemaPayloadDTO(InDTO):
+     custom_prompt: Optional[str] = None
+ 
+ 
++class GraphFeedbackWeightsUpdatePayloadDTO(InDTO):
++    node_ids: list[str] = Field(default_factory=list)
++    edge_ids: list[str] = Field(default_factory=list)
++    target: float
++    alpha: float = 0.05
++
++
++def _stream_update_weight(previous_weight: float, target: float, alpha: float) -> float:
++    updated = float(previous_weight) + float(alpha) * (float(target) - float(previous_weight))
++    clipped = max(0.0, min(1.0, updated))
++    return round(clipped, 4)
++
++
++def _unique_ids(values: list[str]) -> list[str]:
++    out: list[str] = []
++    seen: set[str] = set()
++    for value in values:
++        if isinstance(value, str) and value and value not in seen:
++            seen.add(value)
++            out.append(value)
++    return out
++
++
+ def get_datasets_router() -> APIRouter:
+     router = APIRouter()
+ 
+@@ -298,6 +326,56 @@ def get_datasets_router() -> APIRouter:
+ 
+         return graph_data
+ 
++    @router.post("/{dataset_id}/graph/feedback-weights")
++    async def update_dataset_graph_feedback_weights(
++        dataset_id: UUID,
++        payload: GraphFeedbackWeightsUpdatePayloadDTO,
++        user: User = Depends(get_authenticated_user),
++    ):
++        dataset = await get_authorized_dataset(user, dataset_id, "write")
++        if not dataset:
++            raise HTTPException(status_code=404, detail="Dataset not found or not writable")
++
++        if payload.alpha <= 0 or payload.alpha > 1:
++            raise HTTPException(status_code=400, detail="alpha must be in range (0, 1]")
++        if payload.target < 0 or payload.target > 1:
++            raise HTTPException(status_code=400, detail="target must be in range 0..1")
++
++        await set_database_global_context_variables(dataset.id, dataset.owner_id)
++        graph_engine = await get_graph_engine()
++
++        node_ids = _unique_ids(payload.node_ids or [])
++        edge_ids = _unique_ids(payload.edge_ids or [])
++
++        existing_node_weights = await graph_engine.get_node_feedback_weights(node_ids) if node_ids else {}
++        existing_edge_weights = await graph_engine.get_edge_feedback_weights(edge_ids) if edge_ids else {}
++
++        node_updates = {
++            node_id: _stream_update_weight(weight, payload.target, payload.alpha)
++            for node_id, weight in existing_node_weights.items()
++        }
++        edge_updates = {
++            edge_id: _stream_update_weight(weight, payload.target, payload.alpha)
++            for edge_id, weight in existing_edge_weights.items()
++        }
++
++        node_result = await graph_engine.set_node_feedback_weights(node_updates) if node_updates else {}
++        edge_result = await graph_engine.set_edge_feedback_weights(edge_updates) if edge_updates else {}
++
++        applied = sum(1 for ok in node_result.values() if ok) + sum(1 for ok in edge_result.values() if ok)
++        processed = len(node_ids) + len(edge_ids)
++        skipped = processed - applied
++
++        return {
++            "processed": processed,
++            "applied": applied,
++            "skipped": skipped,
++            "target": payload.target,
++            "alpha": payload.alpha,
++            "node_count": len(node_ids),
++            "edge_count": len(edge_ids),
++        }
++
+     @router.get(
+         "/{dataset_id}/data",
+         response_model=list[DataDTO],
+diff --git a/cognee/modules/graph/methods/get_formatted_graph_data.py b/cognee/modules/graph/methods/get_formatted_graph_data.py
+index 34b354722..468f4e58e 100644
+--- a/cognee/modules/graph/methods/get_formatted_graph_data.py
++++ b/cognee/modules/graph/methods/get_formatted_graph_data.py
+@@ -41,6 +41,12 @@ async def get_formatted_graph_data(dataset_id: UUID, user: User):
+                     "source": str(edge[0]),
+                     "target": str(edge[1]),
+                     "label": str(edge[2]),
++                    "edge_object_id": (
++                        edge[3].get("edge_object_id")
++                        if len(edge) > 3 and isinstance(edge[3], dict)
++                        else None
++                    ),
++                    "properties": edge[3] if len(edge) > 3 and isinstance(edge[3], dict) else {},
+                 },
+                 edges,
+             )
+diff --git a/cognee/tests/unit/api/v1/test_dataset_graph_feedback_weights.py b/cognee/tests/unit/api/v1/test_dataset_graph_feedback_weights.py
+new file mode 100644
+index 000000000..aa1ce2cdf
+--- /dev/null
++++ b/cognee/tests/unit/api/v1/test_dataset_graph_feedback_weights.py
+@@ -0,0 +1,112 @@
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++from uuid import uuid4
++import importlib
++
++import pytest
++from fastapi import HTTPException
++from fastapi.routing import APIRoute
++
++
++def _get_route_endpoint(router, path: str, method: str):
++    for route in router.routes:
++        if isinstance(route, APIRoute) and route.path == path and method in route.methods:
++            return route.endpoint
++
++    raise AssertionError(f"Route {method} {path} not found")
++
++
++@pytest.mark.asyncio
++async def test_update_dataset_graph_feedback_weights_applies_streaming_updates(monkeypatch):
++    datasets_router_module = importlib.import_module(
++        "cognee.api.v1.datasets.routers.get_datasets_router"
++    )
++
++    dataset_id = uuid4()
++    owner_id = uuid4()
++    graph_engine = SimpleNamespace(
++        get_node_feedback_weights=AsyncMock(return_value={"node-1": 0.2, "node-2": 0.5}),
++        get_edge_feedback_weights=AsyncMock(return_value={"edge-1": 0.8}),
++        set_node_feedback_weights=AsyncMock(return_value={"node-1": True, "node-2": True}),
++        set_edge_feedback_weights=AsyncMock(return_value={"edge-1": True}),
++    )
++
++    monkeypatch.setattr(
++        datasets_router_module,
++        "get_authorized_dataset",
++        AsyncMock(return_value=SimpleNamespace(id=dataset_id, owner_id=owner_id)),
++    )
++    monkeypatch.setattr(
++        datasets_router_module,
++        "set_database_global_context_variables",
++        AsyncMock(),
++    )
++    monkeypatch.setattr(
++        datasets_router_module,
++        "get_graph_engine",
++        AsyncMock(return_value=graph_engine),
++    )
++
++    payload = datasets_router_module.GraphFeedbackWeightsUpdatePayloadDTO(
++        node_ids=["node-1", "node-1", "node-2"],
++        edge_ids=["edge-1"],
++        target=1.0,
++        alpha=0.5,
++    )
++    endpoint = _get_route_endpoint(
++        datasets_router_module.get_datasets_router(),
++        "/{dataset_id}/graph/feedback-weights",
++        "POST",
++    )
++
++    response = await endpoint(
++        dataset_id=dataset_id,
++        payload=payload,
++        user=SimpleNamespace(id=str(uuid4())),
++    )
++
++    assert response == {
++        "processed": 3,
++        "applied": 3,
++        "skipped": 0,
++        "target": 1.0,
++        "alpha": 0.5,
++        "node_count": 2,
++        "edge_count": 1,
++    }
++    graph_engine.set_node_feedback_weights.assert_awaited_once_with(
++        {"node-1": 0.6, "node-2": 0.75}
++    )
++    graph_engine.set_edge_feedback_weights.assert_awaited_once_with({"edge-1": 0.9})
++
++
++@pytest.mark.asyncio
++async def test_update_dataset_graph_feedback_weights_validates_alpha(monkeypatch):
++    datasets_router_module = importlib.import_module(
++        "cognee.api.v1.datasets.routers.get_datasets_router"
++    )
++
++    dataset_id = uuid4()
++    monkeypatch.setattr(
++        datasets_router_module,
++        "get_authorized_dataset",
++        AsyncMock(return_value=SimpleNamespace(id=dataset_id, owner_id=uuid4())),
++    )
++
++    payload = datasets_router_module.GraphFeedbackWeightsUpdatePayloadDTO(
++        node_ids=["node-1"],
++        target=0.6,
++        alpha=0,
++    )
++    endpoint = _get_route_endpoint(
++        datasets_router_module.get_datasets_router(),
++        "/{dataset_id}/graph/feedback-weights",
++        "POST",
++    )
++
++    with pytest.raises(HTTPException, match="alpha must be in range \\(0, 1]"):
++        await endpoint(
++            dataset_id=dataset_id,
++            payload=payload,
++            user=SimpleNamespace(id=str(uuid4())),
++        )
+diff --git a/cognee/tests/unit/api/v1/test_dataset_schema_endpoints.py b/cognee/tests/unit/api/v1/test_dataset_schema_endpoints.py
+index ecfc63cd6..aae60d650 100644
+--- a/cognee/tests/unit/api/v1/test_dataset_schema_endpoints.py
++++ b/cognee/tests/unit/api/v1/test_dataset_schema_endpoints.py
+@@ -99,3 +99,15 @@ def test_dataset_schema_payload_dto_validation():
+     dto_empty = DatasetSchemaPayloadDTO()
+     assert dto_empty.graph_schema is None
+     assert dto_empty.custom_prompt is None
++
++
++def test_graph_feedback_weights_helpers():
++    """Verify graph feedback helpers dedupe ids and clamp updates."""
++    from cognee.api.v1.datasets.routers.get_datasets_router import (
++        _stream_update_weight,
++        _unique_ids,
++    )
++
++    assert _unique_ids(["node-1", "", "node-1", "node-2"]) == ["node-1", "node-2"]
++    assert _stream_update_weight(0.2, 1.0, 0.5) == 0.6
++    assert _stream_update_weight(0.95, 1.0, 2.0) == 1.0
+diff --git a/cognee/tests/unit/modules/graph/test_get_formatted_graph_data.py b/cognee/tests/unit/modules/graph/test_get_formatted_graph_data.py
+new file mode 100644
+index 000000000..ed337f8ae
+--- /dev/null
++++ b/cognee/tests/unit/modules/graph/test_get_formatted_graph_data.py
+@@ -0,0 +1,82 @@
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++from uuid import uuid4
++import importlib
++
++import pytest
++
++
++@pytest.mark.asyncio
++async def test_get_formatted_graph_data_includes_edge_object_details(monkeypatch):
++    graph_data_module = importlib.import_module(
++        "cognee.modules.graph.methods.get_formatted_graph_data"
++    )
++
++    dataset_id = uuid4()
++    owner_id = uuid4()
++    graph_engine = SimpleNamespace(
++        get_graph_data=AsyncMock(
++            return_value=(
++                [
++                    (
++                        "node-1",
++                        {
++                            "type": "Entity",
++                            "name": "Node One",
++                            "confidence": 0.8,
++                        },
++                    )
++                ],
++                [
++                    (
++                        "node-1",
++                        "node-2",
++                        "CONNECTED_TO",
++                        {
++                            "edge_object_id": "edge-1",
++                            "feedback_weight": 0.7,
++                        },
++                    )
++                ],
++            )
++        )
++    )
++
++    monkeypatch.setattr(
++        graph_data_module,
++        "get_authorized_dataset",
++        AsyncMock(return_value=SimpleNamespace(id=dataset_id, owner_id=owner_id)),
++    )
++    monkeypatch.setattr(
++        graph_data_module,
++        "set_database_global_context_variables",
++        AsyncMock(),
++    )
++    monkeypatch.setattr(
++        graph_data_module,
++        "get_graph_engine",
++        AsyncMock(return_value=graph_engine),
++    )
++
++    result = await graph_data_module.get_formatted_graph_data(
++        dataset_id,
++        SimpleNamespace(id=uuid4()),
++    )
++
++    assert result["nodes"] == [
++        {
++            "id": "node-1",
++            "label": "Node One",
++            "type": "Entity",
++            "properties": {"confidence": 0.8},
++        }
++    ]
++    assert result["edges"] == [
++        {
++            "source": "node-1",
++            "target": "node-2",
++            "label": "CONNECTED_TO",
++            "edge_object_id": "edge-1",
++            "properties": {"edge_object_id": "edge-1", "feedback_weight": 0.7},
++        }
++    ]
+-- 
+2.47.3
+
