@@ -35,6 +35,28 @@ logger = get_logger()
 observe = get_observe()
 
 
+def _normalize_openai_compatible_base(endpoint: Optional[str]) -> Optional[str]:
+    """Normalise custom OpenAI-compatible endpoints to a /v1 base URL."""
+    if not endpoint:
+        return endpoint
+
+    base = endpoint.rstrip("/")
+    if base.endswith("/v1/chat/completions"):
+        base = base[: -len("/chat/completions")]
+    elif base.endswith("/chat/completions"):
+        base = base[: -len("/chat/completions")]
+
+    if not base.endswith("/v1"):
+        base = f"{base}/v1"
+
+    return base
+
+
+def _looks_like_provider_prefixed_model(model: str) -> bool:
+    """Return True when the model already declares a LiteLLM provider prefix."""
+    return "/" in model
+
+
 def _enrich_llm_span(model: str, name: str) -> None:
     """Set LLM attributes on the current OTEL span, if tracing is enabled."""
     from cognee.modules.observability.trace_context import is_tracing_enabled
@@ -99,6 +121,11 @@ class GenericAPIAdapter(LLMInterface):
         self.fallback_endpoint = fallback_endpoint
         self._base_llm_args = dict(llm_args or {})
         self.llm_args = dict(self._base_llm_args)
+        self._force_openai_compatible = bool(
+            self.endpoint
+            and not self.llm_args.get("custom_llm_provider")
+            and not _looks_like_provider_prefixed_model(self.model)
+        )
 
         self.instructor_mode = instructor_mode if instructor_mode else self.default_instructor_mode
 
@@ -108,6 +135,13 @@ class GenericAPIAdapter(LLMInterface):
             extra_body = dict(self.llm_args.get("extra_body", {}))
             extra_body["strict"] = False
             self.llm_args["extra_body"] = extra_body
+        elif self._force_openai_compatible:
+            self.model = f"openai/{self.model}"
+
+        if self._force_openai_compatible:
+            self.endpoint = _normalize_openai_compatible_base(self.endpoint)
+            if self.fallback_endpoint:
+                self.fallback_endpoint = _normalize_openai_compatible_base(self.fallback_endpoint)
 
         self.aclient = instructor.from_litellm(
             litellm.acompletion, mode=instructor.Mode(self.instructor_mode)
@@ -196,6 +230,12 @@ class GenericAPIAdapter(LLMInterface):
                 fallback_extra_body = dict(fallback_llm_args.get("extra_body", {}))
                 fallback_extra_body["strict"] = False
                 fallback_llm_args["extra_body"] = fallback_extra_body
+            elif (
+                fallback_model
+                and self._force_openai_compatible
+                and not _looks_like_provider_prefixed_model(fallback_model)
+            ):
+                fallback_model = f"openai/{fallback_model}"
 
             try:
                 async with llm_rate_limiter_context_manager():

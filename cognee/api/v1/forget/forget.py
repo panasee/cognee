@@ -192,7 +192,21 @@ async def _resolve_dataset_id(dataset_ref: Union[str, UUID], user) -> UUID:
             raise ValueError(f"Dataset {dataset_ref} not found or not accessible.")
         return dataset.id
 
+    try:
+        dataset_uuid = UUID(dataset_ref)
+    except (TypeError, ValueError, AttributeError):
+        dataset_uuid = None
+
+    if dataset_uuid is not None:
+        from cognee.modules.data.methods.get_authorized_dataset import get_authorized_dataset
+
+        dataset = await get_authorized_dataset(user, dataset_uuid, "delete")
+        if dataset:
+            return dataset.id
+
     from cognee.modules.data.methods import get_authorized_dataset_by_name
 
     dataset = await get_authorized_dataset_by_name(dataset_ref, user, "delete")
+    if not dataset:
+        raise ValueError(f"Dataset {dataset_ref} not found or not accessible.")
     return dataset.id
