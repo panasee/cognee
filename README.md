@@ -37,7 +37,7 @@
   </a>
 </p>
 
-Use our knowledge engine to build personalized and dynamic memory for AI Agents.
+Cognee gives AI agents a shared, improving memory of your data, decisions, and workflows so they can recall, connect, and act with context.
 
   <p align="center">
   🌐 Available Languages
