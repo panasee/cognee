@@ -105,7 +105,9 @@ async def test_llm_connection() -> None:
                 api_base=llm_config.llm_endpoint or None,
                 api_version=llm_config.llm_api_version or None,
                 messages=[{"role": "user", "content": "hi"}],
-                max_tokens=1,
+                # Reasoning models (o1/o3/gpt-5) consume the budget on hidden reasoning
+                # before emitting output and 400 if the cap is too small, so leave headroom.
+                max_tokens=256,
                 num_retries=0,
             ),
             timeout=CONNECTION_TEST_TIMEOUT_SECONDS,
@@ -124,6 +126,16 @@ async def test_llm_connection() -> None:
             "Set COGNEE_SKIP_CONNECTION_TEST=true to bypass this check."
         )
         logger.error(msg)
+        raise e
+    except litellm.exceptions.BadRequestError as e:
+        # A "max_tokens / output limit reached" 400 still proves the endpoint is reachable
+        # and the credentials are accepted — treat it as a passing preflight rather than
+        # failing the whole pipeline on an artifact of our tiny ping.
+        if "max_tokens" in str(e).lower() or "output limit" in str(e).lower():
+            logger.debug("LLM preflight hit token-limit response; treating as reachable.")
+            return
+        logger.error(e)
+        logger.error("Connection to LLM could not be established.")
         raise e
     except Exception as e:
         logger.error(e)
