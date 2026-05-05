@@ -2,7 +2,7 @@ import asyncio
 
 import litellm
 
-from cognee.infrastructure.llm.LLMGateway import LLMGateway
+from cognee.infrastructure.llm.config import get_llm_config
 from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.get_llm_client import (
     get_llm_client,
 )
@@ -79,15 +79,34 @@ def get_model_max_completion_tokens(model_name: str) -> int | None:
 
 async def test_llm_connection() -> None:
     """
-    Test connectivity to the LLM endpoint using a simple completion call.
+    Test connectivity to the LLM endpoint using a minimal completion call.
+
+    Uses litellm.acompletion with a single-token ping rather than the structured-output
+    path, so the preflight stays uniform across providers and isn't subject to the
+    instructor + tenacity retry stack inside the provider adapters (which can mask a
+    fast failure behind exponential backoff and trigger spurious timeouts).
     """
+    llm_config = get_llm_config()
+    model = llm_config.llm_model
+    provider = llm_config.llm_provider
+    # Some configs duplicate the provider in the model id (e.g. provider="anthropic",
+    # model="anthropic/claude-..."); pass an unprefixed model and let
+    # custom_llm_provider drive routing.
+    if provider and model.startswith(f"{provider}/"):
+        model = model[len(provider) + 1 :]
+
     try:
         logger.info("Testing connection to LLM endpoint...")
         await asyncio.wait_for(
-            LLMGateway.acreate_structured_output(
-                text_input="test",
-                system_prompt='Respond to me with the following string: "test"',
-                response_model=str,
+            litellm.acompletion(
+                model=model,
+                custom_llm_provider=provider or None,
+                api_key=llm_config.llm_api_key,
+                api_base=llm_config.llm_endpoint or None,
+                api_version=llm_config.llm_api_version or None,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=1,
+                num_retries=0,
             ),
             timeout=CONNECTION_TEST_TIMEOUT_SECONDS,
         )
