@@ -111,3 +111,39 @@ def test_graph_feedback_weights_helpers():
     assert _unique_ids(["node-1", "", "node-1", "node-2"]) == ["node-1", "node-2"]
     assert _stream_update_weight(0.2, 1.0, 0.5) == 0.6
     assert _stream_update_weight(0.95, 1.0, 2.0) == 1.0
+
+
+def test_inferred_graph_schema_dto_accepts_json_schema_shape():
+    """Verify InferredGraphSchemaDTO accepts required fields and $defs alias."""
+    from cognee.api.v1.llm.routers.get_llm_router import InferredGraphSchemaDTO
+
+    dto = InferredGraphSchemaDTO.model_validate(
+        {
+            "title": "CompanyGraph",
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+            "$defs": {
+                "Person": {
+                    "title": "Person",
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
+                }
+            },
+            "additional_json_schema_keyword": True,
+        }
+    )
+
+    dumped = dto.model_dump(by_alias=True)
+    assert dumped["$defs"]["Person"]["title"] == "Person"
+    assert dumped["additional_json_schema_keyword"] is True
+
+
+def test_inferred_graph_schema_dto_requires_core_fields():
+    """Verify InferredGraphSchemaDTO enforces title/type/properties fields."""
+    from pydantic import ValidationError
+    from cognee.api.v1.llm.routers.get_llm_router import InferredGraphSchemaDTO
+
+    with pytest.raises(ValidationError):
+        InferredGraphSchemaDTO.model_validate({"type": "object", "properties": {}})

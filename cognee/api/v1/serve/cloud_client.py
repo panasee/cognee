@@ -90,19 +90,64 @@ class CloudClient:
                 raise RuntimeError(f"Remote remember failed ({resp.status}): {body}")
             return await resp.json()
 
-    async def recall(self, query_text: str, query_type: Optional[str] = None, **kwargs) -> list:
-        """POST /api/v1/recall — query the knowledge graph."""
+    async def remember_entry(
+        self,
+        entry,
+        dataset_name: str = "main_dataset",
+        session_id: Optional[str] = None,
+    ) -> dict:
+        """POST /api/v1/remember/entry — store a typed MemoryEntry in session cache.
+
+        ``entry`` is a pydantic MemoryEntry (QAEntry / TraceEntry / FeedbackEntry).
+        """
+        if session_id is None:
+            raise ValueError("session_id is required for typed memory entries")
+
         session = await self._get_session()
 
-        payload = {"query": query_text}
+        # Pydantic v2: model_dump preserves the discriminator field.
+        entry_dump = entry.model_dump(mode="json")
+
+        payload = {
+            "entry": entry_dump,
+            "dataset_name": dataset_name,
+            "session_id": session_id,
+        }
+
+        async with session.post(
+            f"{self.service_url}/api/v1/remember/entry",
+            json=payload,
+        ) as resp:
+            if resp.status >= 400:
+                body = await resp.text()
+                raise RuntimeError(f"Remote remember_entry failed ({resp.status}): {body}")
+            return await resp.json()
+
+    async def recall(self, query_text: str, query_type: Optional[str] = None, **kwargs) -> list:
+        """POST /api/v1/recall — query the knowledge graph and/or session cache."""
+        session = await self._get_session()
+
+        payload: dict = {"query": query_text}
         if query_type:
             payload["search_type"] = query_type if isinstance(query_type, str) else query_type.value
-        if kwargs.get("datasets"):
+        if kwargs.get("dataset_ids"):
+            payload["dataset_ids"] = [str(dataset_id) for dataset_id in kwargs["dataset_ids"]]
+        elif kwargs.get("datasets"):
             payload["datasets"] = kwargs["datasets"]
         if kwargs.get("top_k"):
             payload["top_k"] = kwargs["top_k"]
         if kwargs.get("system_prompt"):
             payload["system_prompt"] = kwargs["system_prompt"]
+        if kwargs.get("node_name"):
+            payload["node_name"] = kwargs["node_name"]
+        if kwargs.get("only_context"):
+            payload["only_context"] = kwargs["only_context"]
+        if kwargs.get("verbose"):
+            payload["verbose"] = kwargs["verbose"]
+        if kwargs.get("session_id"):
+            payload["session_id"] = kwargs["session_id"]
+        if kwargs.get("scope") is not None:
+            payload["scope"] = kwargs["scope"]
 
         async with session.post(
             f"{self.service_url}/api/v1/recall",
